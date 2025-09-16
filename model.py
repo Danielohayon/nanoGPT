@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import os
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -42,7 +43,20 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if os.getenv("ATTEN_MODE", None) == "regular":
+            self.flash = False
+            print("disabled flash")
+        elif os.getenv("ATTEN_MODE", None) == "flash":
+            self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+            print(f"using flash {self.flash}")
+        elif os.getenv("ATTEN_MODE", None) == "topk_naive":
+            self.topk = True
+            self.flash = False
+        else: 
+            self.topk = False
+            self.flash = False
+
+
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -63,12 +77,26 @@ class CausalSelfAttention(nn.Module):
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            if not self.topk:
+                # manual implementation of attention
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+                att = F.softmax(att, dim=-1)
+                att = self.attn_dropout(att)
+                y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            else:
+                top_k = 128
+                scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                scores = scores.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+                top_k_scores, top_k_indices = torch.topk(scores, k=top_k, dim=-1)
+                attn_weights = torch.softmax(top_k_scores, dim=-1)
+                
+                expanded_indices = top_k_indices.unsqueeze(-1).expand(-1, -1, -1, -1, v.shape[-1])
+                v_expanded = v.unsqueeze(2).expand(-1, -1, q.shape[2], -1, -1)
+                gathered_v = torch.gather(v_expanded, 3, expanded_indices)
+                
+                y = torch.matmul(attn_weights.unsqueeze(3), gathered_v).squeeze(3)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
