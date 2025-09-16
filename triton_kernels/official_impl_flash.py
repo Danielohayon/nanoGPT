@@ -313,6 +313,9 @@ class _attention(torch.autograd.Function):
             num_warps=num_warps,
             num_stages=1,
         )
+        o  = o.contiguous()     # <— important when compiled
+        L = L.contiguous()
+        m = m.contiguous()
         ctx.save_for_backward(q, k, v, o, L, m)
         ctx.BLOCK = BLOCK
         ctx.grid = grid
@@ -324,21 +327,18 @@ class _attention(torch.autograd.Function):
     def backward(ctx, do):
         q, k, v, o, l, m = ctx.saved_tensors
         do = do.contiguous()
+        # o  = o.contiguous()     # <— important when compiled
+
         dq = torch.zeros_like(q, dtype=torch.float32)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
-        do_scaled = torch.empty_like(do)
+        do_scaled = torch.empty_like(do)  # same layout as `do`
         delta = torch.empty_like(l)
-        _bwd_preprocess[(ctx.grid[0] * ctx.grid[1],)](
-            o,
-            do,
-            l,
-            do_scaled,
-            delta,
-            BLOCK_M=ctx.BLOCK,
-            D_HEAD=ctx.BLOCK_DMODEL,
-        )
 
+        _bwd_preprocess[(ctx.grid[0] * ctx.grid[1],)](
+            o, do, l, do_scaled, delta,
+            BLOCK_M=ctx.BLOCK, D_HEAD=ctx.BLOCK_DMODEL,
+        )
         # NOTE: kernel currently buggy for other values of `num_warps`
         num_warps = 8
         _bwd_kernel[(ctx.grid[1],)](
