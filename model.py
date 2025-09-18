@@ -16,6 +16,9 @@ import torch.nn as nn
 from torch.nn import functional as F
 import os
 
+from triton_kernels.official_impl_flash import _attention, attention 
+from triton_kernels.simple_threshold import threshold_attention 
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -40,68 +43,162 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
+        self.threshold = 0.7422
+        self.topk_eval_interval = 5 * 40
         self.n_embd = config.n_embd
+        self.top_k = 400
         self.dropout = config.dropout
+        self.iter = 0
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        if os.getenv("ATTEN_MODE", None) == "regular":
-            self.flash = False
-            print("disabled flash")
-        elif os.getenv("ATTEN_MODE", None) == "flash":
-            self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-            print(f"using flash {self.flash}")
-        elif os.getenv("ATTEN_MODE", None) == "topk_naive":
-            self.topk = True
-            self.flash = False
-        else: 
-            self.topk = False
-            self.flash = False
+        self.atten_mode = os.getenv("ATTEN_MODE", None)
+        print(f"****************** ATTEN_MODE: {self.atten_mode} **************************")
+        # if os.getenv("ATTEN_MODE", None) == "regular":
+        #     self.flash = False
+        #     print("disabled flash")
+        # elif os.getenv("ATTEN_MODE", None) == "flash":
+        #     self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        #     print(f"using flash {self.flash}")
+        # elif os.getenv("ATTEN_MODE", None) == "topk_naive":
+        #     self.topk = True
+        #     self.flash = False
+        # else: 
+        #     self.topk = False
+        #     self.flash = False
 
 
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+        # if not self.flash:
+        #     print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+        #     # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                    .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2).contiguous() # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2).contiguous() # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2).contiguous() # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
+        if not self.atten_mode:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            if not self.topk:
-                # manual implementation of attention
-                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-                att = F.softmax(att, dim=-1)
-                att = self.attn_dropout(att)
-                y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-            else:
-                top_k = 128
-                scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                scores = scores.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-                top_k_scores, top_k_indices = torch.topk(scores, k=top_k, dim=-1)
-                attn_weights = torch.softmax(top_k_scores, dim=-1)
-                
-                expanded_indices = top_k_indices.unsqueeze(-1).expand(-1, -1, -1, -1, v.shape[-1])
-                v_expanded = v.unsqueeze(2).expand(-1, -1, q.shape[2], -1, -1)
-                gathered_v = torch.gather(v_expanded, 3, expanded_indices)
-                
-                y = torch.matmul(attn_weights.unsqueeze(3), gathered_v).squeeze(3)
+        elif self.atten_mode == "og_pytorch":
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        elif self.atten_mode == "top_k_pytorch":
+            top_k = 4
+            scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            scores = scores.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            top_k_scores, top_k_indices = torch.topk(scores, k=top_k, dim=-1)
+            attn_weights = torch.softmax(top_k_scores, dim=-1)
+            
+            expanded_indices = top_k_indices.unsqueeze(-1).expand(-1, -1, -1, -1, v.shape[-1])
+            v_expanded = v.unsqueeze(2).expand(-1, -1, q.shape[2], -1, -1)
+            gathered_v = torch.gather(v_expanded, 3, expanded_indices)
+            
+            y = torch.matmul(attn_weights.unsqueeze(3), gathered_v).squeeze(3)
+
+        elif self.atten_mode == "flash_triton":
+            y = attention(q, k, v, (1.0 / math.sqrt(k.size(-1))))
+
+        elif self.atten_mode == "thresh_triton":
+            if self.iter % self.topk_eval_interval == 0:
+                self.set_threshold_fast(q, k)
+            y = threshold_attention(q, k, v, (1.0 / math.sqrt(k.size(-1))), self.threshold, 0, 2, 1)
+            self.iter += 1
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+
+
+
+    @torch.no_grad()
+    def set_threshold_fast(self, q, k):
+        """
+        Exact global-threshold via selection (no full sort).
+        Matches your semantics: use batch 0, all heads, all tokens,
+        and a single scalar threshold so that ~top_k per row on average survive.
+
+        Assumes:
+          - q, k shape: [B, H, T, D]
+          - self.bias broadcastable to [H, T, T] or [1, 1, T, T] with 1/0 mask
+          - self.top_k is the desired average count per row (int)
+        """
+        assert q.dim() == 4 and k.dim() == 4
+        B, H, T, D = q.shape
+
+        q0 = q[0]                             # [H, T, D]
+        k0 = k[0]                             # [H, T, D]
+        scale = 1.0 / math.sqrt(k0.size(-1))
+
+        # matmul in mixed precision where possible
+        use_amp = q0.dtype in (torch.float16, torch.bfloat16)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            # scores: [H, T, T]
+            scores = torch.matmul(q0, k0.transpose(-2, -1)) * scale
+
+        # apply mask; make masked entries very negative so they never get selected
+        # support bias of shape [1,1,T,T] or [H,1,T,T] or [H,T,T]
+        bias = self.bias[..., :T, :T]
+        # make bias broadcast to [H, T, T]
+        if bias.dim() == 4:
+            # e.g., [1,1,T,T] or [B,1,T,T] etc. -> take 0th on batch dim if present
+            bias = bias[0] if bias.size(0) == 1 else bias
+            bias = bias.squeeze(0) if bias.size(0) == 1 else bias
+        # now bias should be [H, T, T] or [1, T, T]
+        scores = scores.masked_fill(bias == 0, -float("inf"))
+
+        # total K we want globally across H*T rows
+        K_total = int(self.top_k) * H * T
+        if K_total <= 0:
+            self.threshold = float("inf")
+            return
+
+        # Selection: kth largest of 'scores' without sorting everything.
+        # torch.kthvalue finds k-th *smallest*, so operate on negative.
+        s_flat = scores.reshape(-1)
+        # Replace -inf so it won’t break negation; they should never be chosen anyway.
+        s_flat = torch.nan_to_num(s_flat, neginf=-1e38, posinf=1e38)
+        kth_smallest_on_neg = torch.kthvalue((-s_flat), K_total).values
+        tau = float(-kth_smallest_on_neg)
+
+        # (Optional) quick sanity print of achieved average keep-ratio on batch 0
+        # Note: identical to your print but without sorting
+        avg_topk_new = (scores > tau).sum().item()/ (H * T) 
+        avg_topk_prev = (scores > self.threshold).sum().item()/ (H * T) 
+        print(f"[set_threshold_fast] target={self.top_k}, prev_threhold ={self.threshold}, prev_achieved_topk={avg_topk_prev}, new_threshold={tau}, achieved≈{avg_topk_new:.2f}")
+
+        self.threshold = tau
+
+    # def set_threshold(self, q, k, T):
+    #     B, heads, T, H = q.shape
+    #     scores = (q[0] @ k[0].transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+    #     scores = scores.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+    #     topk = torch.sum(scores > self.threshold)/T/heads
+    #     print(f"k values resulting from current threshold: {topk}")
+    #     # scores = scores.view(-1, 
+    #     
+    #     vals, _ = torch.topk(scores[0].flatten(), self.top_k*heads*T)
+    #     self.threshold = float(min(vals))
+    #     # fraq = self.top_k / T
+    #     # self.threshold = quantile(scores[0].to(torch.float32), 1-fraq)
+    #
+    #
+    #
+    #     # for i in range(q.shape[0]):
+    #     #     scores = q[0,:,-1024:,:] @ k[0,:,-1024:,:].transpose(-2,-1)
+    #     #     # scores = scores.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+    #     #     sco2 = sco.masked_fill(self.bias[0,:,-1024:T,-1024:T] == 0, float('-inf'))
 
 class MLP(nn.Module):
 
@@ -174,6 +271,12 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def update_thresh(self):
+        breakpoint()
+        for block in self.transformer.h:
+            block.attention.update()
+
 
     def get_num_params(self, non_embedding=True):
         """

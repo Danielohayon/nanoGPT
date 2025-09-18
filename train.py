@@ -266,10 +266,10 @@ while True:
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
+                "eval - train/loss": losses['train'],
+                "eval - val/loss": losses['val'],
+                "evla - lr": lr,
+                "elal - mfu": running_mfu*100, # convert to percentage
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -308,6 +308,7 @@ while True:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
+    # breakpoint()
     scaler.step(optimizer)
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
@@ -325,13 +326,15 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": lossf,
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
+        if (not iter_num % eval_interval == 0) and iter_num != 1:
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": lossf,
+                    "time": dt*1000,
+                    "lr": lr,
+                    "mfu": running_mfu*100, # convert to percentage
+                })
     iter_num += 1
     local_iter_num += 1
 
