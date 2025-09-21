@@ -217,7 +217,8 @@ def _bwd_kernel(
             # recompute probs on this tile
             q = tl.load(q_ptrs)
             qk = tl.dot(q, tl.trans(k))
-            tile_max = tl.max(tl.max(qk, 1))
+            tile_max = tl.max(tl.max(qk * sm_scale, 1))  # match forward
+
 
             # K/V tile index = start_n, window size in tiles = r+1 with r = start_m_rows//BLOCK_M
             r = start_m_rows // BLOCK_M               # python int
