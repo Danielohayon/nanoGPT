@@ -74,6 +74,7 @@ def _fwd_kernel(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, tl.trans(k))
         qk *= sm_scale
+        qk += tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), 0, float("-inf"))
 
         # tile index of this K/V block and size of causal window in tiles
         kv_tile_idx = start_n // BLOCK_N                 # python int
@@ -86,7 +87,6 @@ def _fwd_kernel(
 
         if take_tile:
             # causal mask
-            qk += tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), 0, float("-inf"))
             # stable softmax piece
             m_ij = tl.max(qk, 1)
             p = tl.exp(qk - m_ij[:, None])
@@ -217,7 +217,9 @@ def _bwd_kernel(
             # recompute probs on this tile
             q = tl.load(q_ptrs)
             qk = tl.dot(q, tl.trans(k))
-            tile_max = tl.max(tl.max(qk * sm_scale, 1))  # match forward
+            qk *= sm_scale #TODO: maybe move scale multiplication to be after mask
+            qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf")) 
+            tile_max = tl.max(tl.max(qk, 1))  # match forward
 
 
             # K/V tile index = start_n, window size in tiles = r+1 with r = start_m_rows//BLOCK_M
@@ -227,9 +229,8 @@ def _bwd_kernel(
 
             take_tile = (tile_max > threshold) | in_first_y | in_last_x
             if take_tile:
-                qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf"))
                 m = tl.load(m_ptrs + offs_m_curr)
-                p = tl.exp(qk * sm_scale - m[:, None])
+                p = tl.exp(qk - m[:, None])
 
                 do = tl.load(do_ptrs)
                 p_t = tl.trans(p.to(do.dtype))
